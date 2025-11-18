@@ -1,27 +1,23 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dev-theo-kim/lectio-divina-be/internal/lib/log"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	swaggerfiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
-
-type Config struct {
-	Port         any      `toml:"port"`
-	Origins      []string `toml:"origins"`
-	AllowHeaders []string `toml:"allow_headers"`
-	IsProduction bool     `toml:"is_production"`
-	Limit        int64    `toml:"limit"` // limit size of request data (megabytes)
-}
 
 type Router struct {
 	config   *Config
@@ -29,8 +25,7 @@ type Router struct {
 	srv      *http.Server
 	basePath string
 	limit    int64
-	log      *zap.Logger
-	lvl      zapcore.Level
+	log      log.Logger
 
 	isProduction bool
 }
@@ -47,25 +42,12 @@ func New(config *Config, basePath string, swagger ...bool) *Router {
 
 	gin.SetMode(gin.ReleaseMode)
 
-	var (
-		log *zap.Logger
-	)
-
-	if config.IsProduction {
-		pConfig := zap.NewProductionConfig()
-		pConfig.Sampling = nil
-		log, _ = pConfig.Build()
-	} else {
-		log, _ = zap.NewDevelopment()
-	}
-
 	r := &Router{
 		config:   config,
 		engine:   gin.New(),
 		basePath: setSlashPrefix(basePath),
 		limit:    config.Limit,
-		log:      log,
-		lvl:      zapcore.InfoLevel,
+		log:      log.New("module", "router"),
 
 		isProduction: config.IsProduction,
 	}
@@ -87,10 +69,10 @@ func New(config *Config, basePath string, swagger ...bool) *Router {
 		}
 	}()
 
-	r.engine.Use(gin.Recovery(), r.limitRequestSize(), r.logger)
+	r.engine.Use(gin.Recovery(), r.limitRequestSize())
 	r.engine.Use(cors.New(cors.Config{
 		AllowOrigins:     allowOrigins,
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "PATCH"},
+		AllowMethods:     []string{GET.String(), POST.String(), PUT.String(), DELETE.String(), PATCH.String()},
 		AllowHeaders:     allowHeaders,
 		ExposeHeaders:    allowHeaders,
 		AllowCredentials: true,
@@ -100,12 +82,7 @@ func New(config *Config, basePath string, swagger ...bool) *Router {
 	r.engine.GET("/api/health", func(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, nil)
 	})
-	r.log.Debug("Success to register api", zap.String("method", GET.String()), zap.String("path", "/api/health"))
-
-	r.engine.GET("/health", func(ctx *gin.Context) {
-		ctx.JSON(http.StatusOK, nil)
-	})
-	r.log.Debug("Success to register api", zap.String("method", GET.String()), zap.String("path", "/health"))
+	r.log.Debug("Success to register api", "method", GET.String(), "path", "/api/health")
 
 	// swagger API 선언
 	if len(swagger) > 0 && swagger[0] {
@@ -136,7 +113,7 @@ func (r *Router) SetMiddleware(middleware ...gin.HandlerFunc) {
 func (r *Router) Run() error {
 	go func() {
 		if err := r.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			r.log.Panic("Failed to load router", zap.Error(err))
+			r.log.Crit("Failed to load router", "error", err)
 		}
 	}()
 
@@ -147,7 +124,7 @@ func (r *Router) Run() error {
 func (r *Router) RunTLS(cert, key string) error {
 	go func() {
 		if err := r.srv.ListenAndServeTLS(cert, key); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			r.log.Panic("Failed to load router", zap.Error(err))
+			r.log.Crit("Failed to load router", "error", err)
 		}
 	}()
 
@@ -157,7 +134,7 @@ func (r *Router) RunTLS(cert, key string) error {
 
 func (r *Router) Shutdown() error {
 	if err := r.srv.Shutdown(context.Background()); err != nil {
-		r.log.Error("Shutdown http server", zap.Error(err))
+		r.log.Error("Shutdown http server", "error", err)
 		return err
 	}
 
@@ -179,12 +156,10 @@ func (r *Router) RegisterHandler(path string, method Method, handlers ...gin.Han
 		r.engine.DELETE(path, handlers...)
 	case PATCH:
 		r.engine.PATCH(path, append(gin.HandlersChain{r.getBodyReusable}, handlers...)...)
-	case WS:
-		r.engine.GET(path, append(gin.HandlersChain{connectWS}, handlers...)...)
 	default:
-		r.log.Panic("Not supported rest method", zap.String("method", method.String()))
+		r.log.Crit("Not supported rest method", "method", method.String())
 	}
-	r.log.Debug("Success to register api", zap.String("method", method.String()), zap.String("path", path))
+	r.log.Info("Success to register api", "method", method.String(), "path", path)
 }
 
 func (r *Router) RegisterHandlersToGroup(groupPath string, handlersInfo map[string]map[Method][]gin.HandlerFunc, middleware ...gin.HandlerFunc) {
@@ -202,10 +177,8 @@ func (r *Router) RegisterHandlersToGroup(groupPath string, handlersInfo map[stri
 				group.DELETE(path, handlers...)
 			case PATCH:
 				group.PATCH(path, append(gin.HandlersChain{r.getBodyReusable}, handlers...)...)
-			case WS:
-				group.GET(path, append(gin.HandlersChain{connectWS}, handlers...)...)
 			default:
-				r.log.Panic("Not supported rest method", zap.String("method", method.String()))
+				r.log.Crit("Not supported rest method", zap.String("method", method.String()))
 			}
 			r.log.Debug("Success to register api", zap.String("method", method.String()), zap.String("path", strings.Join([]string{setSlashPrefix(group.BasePath()), setSlashPrefix(path)}, "")))
 		}
@@ -277,4 +250,19 @@ func setSlashPrefix(path string) string {
 	} else {
 		return strings.Join([]string{"/", path}, "")
 	}
+}
+
+func (r *Router) getBodyReusable(ctx *gin.Context) {
+	body, err := io.ReadAll(ctx.Request.Body)
+	if err != nil {
+		r.log.Error("Failed to read body", zap.Error(err))
+		return
+	}
+
+	reqStr := strings.Join(strings.Fields(string(body)), "")
+
+	ctx.Set(CtxBody, reqStr)
+	ctx.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	ctx.Next()
 }
