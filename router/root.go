@@ -1,3 +1,4 @@
+// Package router provides the router for the service.
 package router
 
 import (
